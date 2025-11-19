@@ -14,6 +14,9 @@ import com.br.wallet.infrastructure.metrics.PixWebhookMetrics;
 import jakarta.transaction.Transactional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.statemachine.StateMachine;
+import org.springframework.statemachine.config.StateMachineFactory;
+import org.springframework.statemachine.support.DefaultStateMachineContext;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -24,19 +27,19 @@ public class HandlePixWebhookUseCase {
 
     private final PixTransferRepository pixTransferRepository;
     private final PixEventRepository pixEventRepository;
-    private final LedgerEntryRepository ledgerEntryRepository;
     private final PixWebhookMetrics pixWebhookMetrics;
+    private final StateMachineFactory<PixTransferStatus, PixEventType> stateMachineFactory;
 
     public HandlePixWebhookUseCase(
             PixTransferRepository pixTransferRepository,
             PixEventRepository pixEventRepository,
-            LedgerEntryRepository ledgerEntryRepository,
-            PixWebhookMetrics pixWebhookMetrics
+            PixWebhookMetrics pixWebhookMetrics,
+            StateMachineFactory<PixTransferStatus, PixEventType> stateMachineFactory
     ) {
         this.pixTransferRepository = pixTransferRepository;
         this.pixEventRepository = pixEventRepository;
-        this.ledgerEntryRepository = ledgerEntryRepository;
         this.pixWebhookMetrics = pixWebhookMetrics;
+        this.stateMachineFactory = stateMachineFactory;
     }
 
     @Transactional
@@ -85,68 +88,24 @@ public class HandlePixWebhookUseCase {
                 pixWebhookMetrics.recordIgnoredFinalized(type, transfer.status());
                 return;
             }
-            if (type == PixEventType.CONFIRMED) {
-                LedgerEntry credit = LedgerEntry.newEntry(
-                        transfer.toWalletId(),
-                        LedgerOperationType.PIX_CREDIT,
-                        LedgerEntryDirection.CREDIT,
-                        transfer.amount(),
-                        transfer.id().toString(),
-                        transfer.endToEndId(),
-                        occurredAt
-                );
-                ledgerEntryRepository.save(credit);
-                log.info(
-                        "HandlePixWebhookUseCase - pix credit applied walletId={}, amount={}, endToEndId={}, eventId={}, ledgerEntryId={}",
-                        transfer.toWalletId(), transfer.amount(), endToEndId, eventId, credit.id()
-                );
-                PixTransfer updated = transfer.markConfirmed();
-                pixTransferRepository.save(updated);
-
-                log.info(
-                        "HandlePixWebhookUseCase - transfer marked as CONFIRMED endToEndId={}, transferId={}",
-                        endToEndId, updated.id()
-                );
-                pixWebhookMetrics.recordAmount(PixTransferStatus.CONFIRMED, transfer.amount());
-                if (transfer.createdAt() != null) {
-                    pixWebhookMetrics.recordSettlementDuration(
-                            PixTransferStatus.CONFIRMED,
-                            Duration.between(transfer.createdAt(), occurredAt)
+            StateMachine<PixTransferStatus, PixEventType> stateMachine =
+                    stateMachineFactory.getStateMachine(transfer.id().toString());
+            stateMachine.stop();
+            stateMachine.getStateMachineAccessor()
+                    .doWithAllRegions(access ->
+                            access.resetStateMachine(
+                                    new DefaultStateMachineContext<>(transfer.status(), null, null, null)
+                            )
                     );
-                }
-            } else if (type == PixEventType.REJECTED) {
-                LedgerEntry reversal = LedgerEntry.newEntry(
-                        transfer.fromWalletId(),
-                        LedgerOperationType.PIX_REVERSAL,
-                        LedgerEntryDirection.CREDIT,
-                        transfer.amount(),
-                        transfer.id().toString(),
-                        transfer.endToEndId(),
-                        occurredAt
-                );
-                ledgerEntryRepository.save(reversal);
-                log.info(
-                        "HandlePixWebhookUseCase - pix reversal applied walletId={}, amount={}, endToEndId={}, eventId={}, ledgerEntryId={}",
-                        transfer.fromWalletId(), transfer.amount(), endToEndId, eventId, reversal.id()
-                );
-                PixTransfer updated = transfer.markRejected();
-                pixTransferRepository.save(updated);
-                log.info(
-                        "HandlePixWebhookUseCase - transfer marked as REJECTED endToEndId={}, transferId={}",
-                        endToEndId, updated.id()
-                );
-                pixWebhookMetrics.recordAmount(PixTransferStatus.REJECTED, transfer.amount());
-                if (transfer.createdAt() != null) {
-                    pixWebhookMetrics.recordSettlementDuration(
-                            PixTransferStatus.REJECTED,
-                            Duration.between(transfer.createdAt(), occurredAt)
-                    );
-                }
-
-            } else {
+            stateMachine.getExtendedState().getVariables().put("transfer", transfer);
+            stateMachine.getExtendedState().getVariables().put("occurredAt", occurredAt);
+            stateMachine.getExtendedState().getVariables().put("eventId", eventId);
+            stateMachine.start();
+            boolean accepted = stateMachine.sendEvent(type);
+            if (!accepted) {
                 log.warn(
-                        "HandlePixWebhookUseCase - unsupported event type received endToEndId={}, eventId={}, eventType={}",
-                        endToEndId, eventId, type
+                        "HandlePixWebhookUseCase - unsupported event transition endToEndId={}, eventId={}, eventType={}, currentStatus={}",
+                        endToEndId, eventId, type, transfer.status()
                 );
                 pixWebhookMetrics.recordUnsupportedType(type);
             }
@@ -158,6 +117,4 @@ public class HandlePixWebhookUseCase {
             pixWebhookMetrics.recordProcessingDuration(type, resultTag, System.nanoTime() - startNs);
         }
     }
-
 }
-
