@@ -19,8 +19,6 @@ spring:
 logging:
   level:
     root: INFO
-    org.hibernate.SQL: DEBUG
-    org.hibernate.type.descriptor.sql.BasicBinder: TRACE
 
 management:
   endpoints:
