@@ -14,9 +14,9 @@ import com.br.wallet.infrastructure.metrics.PixMetrics;
 import jakarta.transaction.Transactional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.Optional;
 import java.util.UUID;
 
 public class CreatePixTransferUseCase {
@@ -47,94 +47,125 @@ public class CreatePixTransferUseCase {
     public PixTransfer execute(UUID fromWalletId, String toPixKey, BigDecimal amount, String idempotencyKey) {
         long startNanos = System.nanoTime();
         pixMetrics.onPixTransferRequested();
-
         log.info(
                 "CreatePixTransferUseCase - starting PIX transfer fromWalletId={}, toPixKey={}, amount={}, idempotencyKey={}",
                 fromWalletId, toPixKey, amount, idempotencyKey
         );
-
         try {
-            PixKey key = pixKeyRepository.findByKeyValue(toPixKey)
-                    .orElseThrow(() -> {
-                        log.warn("CreatePixTransferUseCase - pix key not found toPixKey={}", toPixKey);
-                        return new IllegalArgumentException("Pix key not found");
-                    });
-
+            PixKey key = loadPixKey(toPixKey);
             UUID toWalletId = key.walletId();
-
-            log.info(
-                    "CreatePixTransferUseCase - pix key found toPixKey={}, toWalletId={}",
-                    toPixKey, toWalletId
-            );
-
-            var existing = pixTransferRepository.findByFromWalletIdAndIdempotencyKey(fromWalletId, idempotencyKey);
-            if (existing.isPresent()) {
-                PixTransfer found = existing.get();
-                pixMetrics.onIdempotencyHit();
-                log.info(
-                        "CreatePixTransferUseCase - idempotency hit, returning existing transfer transferId={}, endToEndId={}, fromWalletId={}, toWalletId={}",
-                        found.id(), found.endToEndId(), found.fromWalletId(), found.toWalletId()
-                );
-                return found;
+            Optional<PixTransfer> idempotentResult =
+                    findExistingTransfer(fromWalletId, idempotencyKey);
+            if (idempotentResult.isPresent()) {
+                return idempotentResult.get();
             }
-            pixMetrics.onIdempotencyMiss();
-            Wallet fromWallet = walletRepository.findByIdForUpdate(fromWalletId)
-                    .orElseThrow(() -> {
-                        log.warn("CreatePixTransferUseCase - wallet not found fromWalletId={}", fromWalletId);
-                        return new IllegalArgumentException("Wallet not found");
-                    });
-            BigDecimal balance = ledgerEntryRepository.calculateCurrentBalance(fromWallet.id());
-            log.info(
-                    "CreatePixTransferUseCase - wallet loaded walletId={}, currentBalance={}, requestedAmount={}",
-                    fromWallet.id(), balance, amount
-            );
-            if (balance.compareTo(amount) < 0) {
-                pixMetrics.onInsufficientFunds();
-                log.warn(
-                        "CreatePixTransferUseCase - insufficient funds walletId={}, balance={}, requestedAmount={}",
-                        fromWallet.id(), balance, amount
-                );
-                throw new IllegalStateException("Insufficient funds");
-            }
-            String endToEndId = "E2E-" + UUID.randomUUID();
-            log.info(
-                    "CreatePixTransferUseCase - creating pending transfer endToEndId={}, fromWalletId={}, toWalletId={}, amount={}",
-                    endToEndId, fromWalletId, toWalletId, amount
-            );
-            PixTransfer transfer = PixTransfer.newPending(
-                    fromWalletId,
-                    toWalletId,
-                    amount,
-                    endToEndId,
-                    idempotencyKey
-            );
-            PixTransfer saved = pixTransferRepository.save(transfer);
-            pixMetrics.onPixTransferCreated();
-            log.info(
-                    "CreatePixTransferUseCase - pending transfer created transferId={}, endToEndId={}",
-                    saved.id(), saved.endToEndId()
-            );
-            LedgerEntry debit = LedgerEntry.newEntry(
-                    fromWallet.id(),
-                    LedgerOperationType.PIX_DEBIT,
-                    LedgerEntryDirection.DEBIT,
-                    amount,
-                    saved.id().toString(),
-                    saved.endToEndId(),
-                    Instant.now()
-            );
-            ledgerEntryRepository.save(debit);
-            log.info(
-                    "CreatePixTransferUseCase - ledger debit entry created walletId={}, amount={}, transferId={}, endToEndId={}",
-                    fromWallet.id(), amount, saved.id(), saved.endToEndId()
-            );
+            Wallet fromWallet = loadWalletForUpdate(fromWalletId);
+            validateSufficientFunds(fromWallet, amount);
+            PixTransfer savedTransfer = createPendingTransfer(fromWalletId, toWalletId, amount, idempotencyKey);
+            createDebitLedgerEntry(fromWallet, savedTransfer, amount);
             log.info(
                     "CreatePixTransferUseCase - PIX transfer completed successfully transferId={}, endToEndId={}",
-                    saved.id(), saved.endToEndId()
+                    savedTransfer.id(), savedTransfer.endToEndId()
             );
-            return saved;
+
+            return savedTransfer;
         } finally {
             pixMetrics.recordProcessingTime(startNanos);
         }
+    }
+
+    private PixKey loadPixKey(String toPixKey) {
+        return pixKeyRepository.findByKeyValue(toPixKey)
+                .orElseThrow(() -> {
+                    log.warn("CreatePixTransferUseCase - pix key not found toPixKey={}", toPixKey);
+                    return new IllegalArgumentException("Pix key not found");
+                });
+    }
+
+    private Optional<PixTransfer> findExistingTransfer(UUID fromWalletId, String idempotencyKey) {
+        var existing = pixTransferRepository.findByFromWalletIdAndIdempotencyKey(fromWalletId, idempotencyKey);
+        if (existing.isPresent()) {
+            PixTransfer found = existing.get();
+            pixMetrics.onIdempotencyHit();
+            log.info(
+                    "CreatePixTransferUseCase - idempotency hit, returning existing transfer transferId={}, endToEndId={}, fromWalletId={}, toWalletId={}",
+                    found.id(), found.endToEndId(), found.fromWalletId(), found.toWalletId()
+            );
+        } else {
+            pixMetrics.onIdempotencyMiss();
+        }
+        return existing;
+    }
+
+    private Wallet loadWalletForUpdate(UUID walletId) {
+        return walletRepository.findByIdForUpdate(walletId)
+                .orElseThrow(() -> {
+                    log.warn("CreatePixTransferUseCase - wallet not found fromWalletId={}", walletId);
+                    return new IllegalArgumentException("Wallet not found");
+                });
+    }
+
+    private void validateSufficientFunds(Wallet fromWallet, BigDecimal amount) {
+        BigDecimal balance = ledgerEntryRepository.calculateCurrentBalance(fromWallet.id());
+        log.info(
+                "CreatePixTransferUseCase - wallet loaded walletId={}, currentBalance={}, requestedAmount={}",
+                fromWallet.id(), balance, amount
+        );
+        if (balance.compareTo(amount) < 0) {
+            pixMetrics.onInsufficientFunds();
+            log.warn(
+                    "CreatePixTransferUseCase - insufficient funds walletId={}, balance={}, requestedAmount={}",
+                    fromWallet.id(), balance, amount
+            );
+            throw new IllegalStateException("Insufficient funds");
+        }
+    }
+
+    private PixTransfer createPendingTransfer(
+            UUID fromWalletId,
+            UUID toWalletId,
+            BigDecimal amount,
+            String idempotencyKey
+    ) {
+        String endToEndId = generateEndToEndId();
+        log.info(
+                "CreatePixTransferUseCase - creating pending transfer endToEndId={}, fromWalletId={}, toWalletId={}, amount={}",
+                endToEndId, fromWalletId, toWalletId, amount
+        );
+        PixTransfer transfer = PixTransfer.newPending(
+                fromWalletId,
+                toWalletId,
+                amount,
+                endToEndId,
+                idempotencyKey
+        );
+        PixTransfer saved = pixTransferRepository.save(transfer);
+        pixMetrics.onPixTransferCreated();
+        log.info(
+                "CreatePixTransferUseCase - pending transfer created transferId={}, endToEndId={}",
+                saved.id(), saved.endToEndId()
+        );
+        return saved;
+    }
+
+    private void createDebitLedgerEntry(Wallet fromWallet, PixTransfer transfer, BigDecimal amount) {
+        LedgerEntry debit = LedgerEntry.newEntry(
+                fromWallet.id(),
+                LedgerOperationType.PIX_DEBIT,
+                LedgerEntryDirection.DEBIT,
+                amount,
+                transfer.id().toString(),
+                transfer.endToEndId(),
+                Instant.now()
+        );
+        ledgerEntryRepository.save(debit);
+        log.info(
+                "CreatePixTransferUseCase - ledger debit entry created walletId={}, amount={}, transferId={}, endToEndId={}",
+                fromWallet.id(), amount, transfer.id(), transfer.endToEndId()
+        );
+    }
+
+    private String generateEndToEndId() {
+        return "E2E-" + UUID.randomUUID();
     }
 }
