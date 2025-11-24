@@ -1,3 +1,9 @@
 package com.br.wallet.interfaces.rest.pix.dto;
 
-public record PixWebhookResponse(String status) {}
+import java.time.Instant;
+
+public record PixWebhookResponse(
+        String status,
+        String eventId,
+        Instant receivedAt
+) {}

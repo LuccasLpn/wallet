@@ -7,6 +7,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.Instant;
+
 @RestController
 @RequestMapping("/pix/webhook")
 public class PixWebhookController {
@@ -25,9 +27,14 @@ public class PixWebhookController {
                 request.eventType(),
                 request.occurredAt()
         );
+        PixWebhookResponse response = new PixWebhookResponse(
+                "ACCEPTED",
+                request.eventId(),
+                Instant.now()
+        );
         return ResponseEntity
                 .status(HttpStatus.ACCEPTED)
-                .body(new PixWebhookResponse("ACCEPTED"));
+                .body(response);
     }
 }
 

@@ -1,13 +1,9 @@
 package com.br.wallet.application.usecase.pix;
 
-import com.br.wallet.domain.enums.LedgerEntryDirection;
-import com.br.wallet.domain.enums.LedgerOperationType;
 import com.br.wallet.domain.enums.PixEventType;
 import com.br.wallet.domain.enums.PixTransferStatus;
-import com.br.wallet.domain.model.LedgerEntry;
 import com.br.wallet.domain.model.PixEvent;
 import com.br.wallet.domain.model.PixTransfer;
-import com.br.wallet.domain.port.LedgerEntryRepository;
 import com.br.wallet.domain.port.PixEventRepository;
 import com.br.wallet.domain.port.PixTransferRepository;
 import com.br.wallet.infrastructure.metrics.PixWebhookMetrics;
